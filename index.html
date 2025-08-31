@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>화면공유 웹(승인제)</title>
+  <style>
+    :root{ --bg:#0b1020; --panel:#10183a; --ink:#eaf0ff; --muted:#a7b3d4; --brand:#6aa6ff; --ok:#4cd97b; --danger:#ff6a6a; }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:ui-sans-serif,system-ui,Apple SD Gothic Neo,Noto Sans KR,Segoe UI,Roboto,sans-serif;
+         color:var(--ink);background:radial-gradient(1000px 700px at 80% -10%,#1a2650 0%,#0b1020 45%)}
+    header{padding:18px 20px 10px;display:flex;gap:12px;align-items:center;justify-content:space-between}
+    h1{margin:0;font-size:18px;color:#fff}
+    main{padding:16px;display:grid;gap:16px;grid-template-columns:1fr 360px}
+    .card{background:rgba(16,24,58,.8);border:1px solid #22306b;border-radius:16px;padding:14px;box-shadow:0 8px 30px rgba(0,0,0,.25)}
+    label{display:block;margin-top:8px;font-size:14px;color:var(--muted)}
+    input[type="text"]{width:100%;padding:10px;border-radius:12px;border:1px solid #2a3a77;background:#0d1433;color:#eaf0ff}
+    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    button{padding:10px 14px;border-radius:12px;border:1px solid #2a3a77;background:#101a45;color:#eaf0ff;cursor:pointer}
+    button.primary{background:linear-gradient(180deg,#2b5bd1,#2048a8)}
+    button.danger{background:linear-gradient(180deg,#c24,#932)}
+    small{color:var(--muted)}
+    video{width:100%;background:#000;border-radius:12px}
+    ul{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px}
+    li{padding:10px;border:1px solid #2a3a77;border-radius:12px;background:#0f173b;display:flex;justify-content:space-between;align-items:center}
+    .tag{font-size:12px;padding:3px 8px;border-radius:999px;background:#1b285c;color:#cfe0ff;border:1px solid #2a3a77}
+    .muted{color:var(--muted)}
+    .ok{color:var(--ok)}
+    footer{padding:10px 16px;color:var(--muted);font-size:12px;text-align:center}
+    .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .hint{font-size:12px;color:#a7b3d4}
+  </style>
+</head>
+<body>
+<header>
+  <h1>화면공유 웹(승인제 · WebRTC)</h1>
+  <div class="row">
+    <span class="tag">P2P · 소규모 시청자용</span>
+    <span class="tag">승인제</span>
+    <span class="tag">Firebase 시그널링</span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2 style="margin:0 0 8px 0">라이브</h2>
+    <video id="player" autoplay playsinline controls></video>
+    <div class="grid-2" style="margin-top:10px">
+      <div>
+        <label>모드 선택</label>
+        <div class="row">
+          <label class="row"><input type="radio" name="mode" value="presenter" checked> 송출자</label>
+          <label class="row"><input type="radio" name="mode" value="viewer"> 시청자</label>
+        </div>
+      </div>
+      <div>
+        <label>방 코드(Room ID)</label>
+        <input id="roomId" type="text" placeholder="예: k3G7-9fQ2" />
+        <small class="hint">직접 입력 또는 자동 생성 버튼 사용</small>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="genRoom">방 코드 자동생성</button>
+      <button class="primary" id="startBtn">시작</button>
+      <button class="danger" id="stopBtn" disabled>종료</button>
+    </div>
+    <div style="margin-top:6px">
+      <small id="status" class="muted">대기 중…</small>
+    </div>
+    <div id="presenterHints" style="margin-top:12px;display:none">
+      <small class="hint">
+        * 화면 공유 팁: Chrome/Edge에서 “화면 전체”를 선택하면 시스템 오디오 공유 가능(Windows).  
+        macOS는 보안 권한(화면 기록 등) 허용 필요. iOS는 시스템 오디오 공유 미지원.
+      </small>
+    </div>
+  </section>
+
+  <aside class="card">
+    <h3 style="margin-top:0">승인 대기 목록(송출자 전용)</h3>
+    <ul id="pending"></ul>
+    <hr style="border:none;border-top:1px solid #2a3a77;margin:12px 0"/>
+    <div>
+      <h3 style="margin:0 0 8px 0">연결 정보</h3>
+      <div id="info" class="hint">-</div>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  이 데모는 소규모 시청자에게 최적화된 P2P 구조입니다. 대규모 송출은 SFU(LiveKit/Janus/mediasoup 등) 권장.
+</footer>
+
+<!-- Firebase SDK (Compat) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
+
+<script>
+/** ★★★ 여기를 본인 Firebase 설정으로 교체하세요 ★★★
+ * Firebase 콘솔 → 프로젝트 설정 → 일반 → SDK 설정/구성에서 복사
+ * 아래는 예시입니다. (실운영에서는 본인 키로 교체 필수)
+ */
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PRJ.firebaseapp.com",
+  databaseURL: "https://YOUR_PRJ-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "YOUR_PRJ",
+  storageBucket: "YOUR_PRJ.appspot.com",
+  messagingSenderId: "XXXXXXXXXXXX",
+  appId: "1:XXXXXXXXXXXX:web:YYYYYYYYYYYYYY"
+};
+
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+
+/** UI 엘리먼트 */
+const player = document.getElementById('player');
+const roomIdInput = document.getElementById('roomId');
+const statusEl = document.getElementById('status');
+const pendingEl = document.getElementById('pending');
+const infoEl = document.getElementById('info');
+const presenterHints = document.getElementById('presenterHints');
+
+const startBtn = document.getElementById('startBtn');
+const stopBtn  = document.getElementById('stopBtn');
+const genRoom  = document.getElementById('genRoom');
+
+let mode = 'presenter';
+let localStream = null;
+let pc = null;
+let roomId = '';
+let viewerId = '';
+let isRunning = false;
+
+/** 모드 라디오 */
+document.querySelectorAll('input[name="mode"]').forEach(r => {
+  r.addEventListener('change', () => {
+    mode = document.querySelector('input[name="mode"]:checked').value;
+    presenterHints.style.display = (mode === 'presenter') ? 'block' : 'none';
+  });
+});
+presenterHints.style.display = 'block';
+
+/** 유틸 */
+function logStatus(msg){ statusEl.textContent = msg; }
+function randomId(len=10){
+  const chars='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  let s=''; for(let i=0;i<len;i++) s += chars[Math.floor(Math.random()*chars.length)];
+  return s;
+}
+
+/** STUN (필요 시 TURN 추가) */
+const iceServers = [{ urls: ['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302'] }];
+
+function createPeer(){
+  const _pc = new RTCPeerConnection({ iceServers });
+  _pc.oniceconnectionstatechange = () => {
+    infoEl.textContent = 'ICE: ' + _pc.iceConnectionState;
+  };
+  _pc.onconnectionstatechange = () => {
+    infoEl.textContent += ' | PC: ' + _pc.connectionState;
+  };
+  return _pc;
+}
+
+/** 송출자 로직 */
+async function startPresenter(){
+  roomId = (roomIdInput.value || '').trim();
+  if(!roomId){ roomId = randomId(9); roomIdInput.value = roomId; }
+
+  // 화면 + (가능한 경우) 시스템 오디오
+  try{
+    localStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  }catch(e){
+    alert('화면 캡처 권한이 필요합니다: ' + e.message);
+    return;
+  }
+
+  player.srcObject = localStream;
+
+  // pending offers 리스닝
+  const offersRef = db.ref(`rooms/${roomId}/offers`);
+  offersRef.on('child_added', async snap => {
+    const vid = snap.key;
+    const data = snap.val();
+    if(!data || !data.sdp) return;
+
+    // 승인 UI 추가
+    addPending(vid, data);
+  });
+
+  // 정리 표시
+  isRunning = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  logStatus(`송출 중… 방 코드: ${roomId}`);
+}
+
+/** 대기열 항목 UI */
+function addPending(vid, data){
+  const li = document.createElement('li');
+  li.id = `pending-${vid}`;
+  li.innerHTML = `
+    <div>
+      <div><b>시청자</b> <span class="tag">${vid}</span></div>
+      <div class="muted" style="font-size:12px">오퍼 수신</div>
+    </div>
+    <div class="row">
+      <button class="primary">허용</button>
+      <button class="danger">거절</button>
+    </div>
+  `;
+  const [allowBtn, denyBtn] = li.querySelectorAll('button');
+  allowBtn.onclick = () => acceptViewer(vid, data, li);
+  denyBtn.onclick  = () => denyViewer(vid, li);
+  pendingEl.appendChild(li);
+}
+
+async function acceptViewer(vid, data, li){
+  try{
+    const _pc = createPeer();
+
+    // 화면 스트림 전송
+    localStream.getTracks().forEach(t => _pc.addTrack(t, localStream));
+
+    // 원격 후보 수집
+    const remoteCandidatesRef = db.ref(`rooms/${roomId}/candidates/${vid}/viewer`);
+    remoteCandidatesRef.on('child_added', s => {
+      const c = s.val();
+      if(c) _pc.addIceCandidate(new RTCIceCandidate(c));
+    });
+
+    // 내 ICE 후보 업로드
+    const myCandidatesRef = db.ref(`rooms/${roomId}/candidates/${vid}/presenter`);
+    _pc.onicecandidate = (ev) => {
+      if(ev.candidate){
+        myCandidatesRef.push(ev.candidate.toJSON());
+      }
+    };
+
+    await _pc.setRemoteDescription(new RTCSessionDescription({ type:'offer', sdp:data.sdp }));
+    const answer = await _pc.createAnswer();
+    await _pc.setLocalDescription(answer);
+
+    await db.ref(`rooms/${roomId}/answers/${vid}`).set({ sdp: answer.sdp, ts: Date.now() });
+
+    li.querySelector('.muted').textContent = '연결 진행 중…';
+    li.style.opacity = .7;
+  }catch(e){
+    alert('연결 실패: ' + e.message);
+  }
+}
+
+function denyViewer(vid, li){
+  db.ref(`rooms/${roomId}/offers/${vid}`).remove();
+  db.ref(`rooms/${roomId}/candidates/${vid}`).remove();
+  li.remove();
+}
+
+/** 시청자 로직 */
+async function startViewer(){
+  roomId = (roomIdInput.value || '').trim();
+  if(!roomId){ alert('방 코드를 입력하세요.'); return; }
+
+  viewerId = randomId(8);
+
+  pc = createPeer();
+
+  // 시청 전용 트랜시버(영상/오디오)
+  pc.addTransceiver('video', { direction:'recvonly' });
+  pc.addTransceiver('audio', { direction:'recvonly' });
+
+  pc.ontrack = (ev) => {
+    if(player.srcObject !== ev.streams[0]) player.srcObject = ev.streams[0];
+  };
+
+  // 내 ICE 후보 업로드
+  const myCandidatesRef = db.ref(`rooms/${roomId}/candidates/${viewerId}/viewer`);
+  pc.onicecandidate = (ev) => {
+    if(ev.candidate){
+      myCandidatesRef.push(ev.candidate.toJSON());
+    }
+  };
+
+  // 송출자 ICE 후보 수신
+  const remoteCandidatesRef = db.ref(`rooms/${roomId}/candidates/${viewerId}/presenter`);
+  remoteCandidatesRef.on('child_added', s => {
+    const c = s.val();
+    if(c) pc.addIceCandidate(new RTCIceCandidate(c));
+  });
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  await db.ref(`rooms/${roomId}/offers/${viewerId}`).set({ sdp: offer.sdp, ts: Date.now() });
+
+  // 답변 대기 → 설정
+  db.ref(`rooms/${roomId}/answers/${viewerId}`).on('value', async snap => {
+    const val = snap.val();
+    if(val && val.sdp && pc.signalingState === 'have-local-offer'){
+      await pc.setRemoteDescription(new RTCSessionDescription({ type:'answer', sdp: val.sdp }));
+      logStatus('시청 중…');
+    }
+  });
+
+  isRunning = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  logStatus(`접속 요청 완료. 송출자 승인 대기 중… (내 ID: ${viewerId})`);
+}
+
+/** 시작/종료 버튼 */
+startBtn.addEventListener('click', async () => {
+  const m = document.querySelector('input[name="mode"]:checked').value;
+  if(m === 'presenter') await startPresenter();
+  else await startViewer();
+});
+
+stopBtn.addEventListener('click', async () => {
+  await cleanup();
+});
+
+genRoom.addEventListener('click', () => {
+  roomIdInput.value = `rm-${randomId(9)}`;
+});
+
+async function cleanup(){
+  try{
+    if(localStream){
+      localStream.getTracks().forEach(t => t.stop());
+      localStream = null;
+    }
+    if(pc){
+      pc.getSenders().forEach(s=>s.track && s.track.stop());
+      pc.close(); pc = null;
+    }
+    if(roomId){
+      // 시청자라면 내 흔적(offer/answers/candidates) 정리
+      if(mode==='viewer' && viewerId){
+        await db.ref(`rooms/${roomId}/offers/${viewerId}`).remove();
+        await db.ref(`rooms/${roomId}/answers/${viewerId}`).remove();
+        await db.ref(`rooms/${roomId}/candidates/${viewerId}`).remove();
+      }
+      // 송출자는 의도적으로 남겨 둘 수도 있음(다른 시청자 계속 접속용). 여기서는 그대로 둠.
+    }
+  }catch(e){}
+  isRunning = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  player.srcObject = null;
+  pendingEl.innerHTML = '';
+  logStatus('대기 중…');
+}
+</script>
+</body>
+</html>
