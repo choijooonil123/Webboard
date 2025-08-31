@@ -43,7 +43,7 @@
 <main>
   <section class="card">
     <h2 style="margin:0 0 8px 0">라이브</h2>
-    <!-- autoplay를 위해 muted 기본값 적용 → 클릭 시 해제 -->
+    <!-- autoplay를 위해 muted 기본값 → 버튼으로 해제 -->
     <video id="player" autoplay playsinline muted controls></video>
 
     <div class="grid-2" style="margin-top:10px">
@@ -68,13 +68,20 @@
       <button id="unmuteBtn" style="display:none">🔊 소리 켜기</button>
     </div>
 
+    <!-- 송출자 오디오 증폭 컨트롤 -->
+    <div id="gainRow" class="row" style="margin-top:8px; display:none">
+      <small class="muted">오디오 증폭:</small>
+      <input id="gainSlider" type="range" min="1" max="3" step="0.1" value="2" />
+      <small class="muted"><span id="gainVal">2.0</span>x</small>
+    </div>
+
     <div style="margin-top:6px">
       <small id="status" class="muted">대기 중…</small>
     </div>
 
     <div id="presenterHints" style="margin-top:12px;display:none">
       <small class="hint">
-        * 오디오 팁: Windows는 “전체 화면” 또는 “탭 공유 + 탭 오디오 공유 체크” 권장. macOS는 탭 오디오만 안정적.
+        * 오디오 팁: Windows는 “전체 화면” 또는 “탭 공유 + 탭 오디오 공유 체크” 권장. macOS는 탭 오디오 중심.
       </small>
     </div>
   </section>
@@ -107,7 +114,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
 
 <script>
-/** ★★★ 본인 Firebase 설정으로 교체 ★★★ */
+/** Firebase 설정(사용자 제공 값 적용) */
 const firebaseConfig = {
   apiKey: "AIzaSyA-007jMq4dO7M6t6wn5vR_PZW9Gg1n0LM",
   authDomain: "webboard-ea2c4.firebaseapp.com",
@@ -142,12 +149,19 @@ const stopBtn  = document.getElementById('stopBtn');
 const genRoom  = document.getElementById('genRoom');
 const toastEl  = document.getElementById('toast');
 
+// 증폭 컨트롤
+const gainRow    = document.getElementById('gainRow');
+const gainSlider = document.getElementById('gainSlider');
+const gainVal    = document.getElementById('gainVal');
+
 let mode = 'presenter';
 let localStream = null;
 let pc = null; // viewer side
 let roomId = '';
 let viewerId = '';
 let isRunning = false;
+let audioCtx = null;
+let gainNode = null;
 
 /** helpers */
 function logStatus(msg){ statusEl.textContent = msg; }
@@ -155,14 +169,30 @@ function log(msg){ console.log(msg); logEl.textContent += msg + '\n'; logEl.scro
 function toast(msg){ toastEl.textContent = msg; toastEl.style.display='block'; setTimeout(()=>toastEl.style.display='none', 1800); }
 function randomId(len=10){ const c='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'; let s=''; for(let i=0;i<len;i++) s+=c[Math.floor(Math.random()*c.length)]; return s; }
 
-/** mode toggle */
+/** 기본 볼륨 최대로 */
+player.volume = 1.0;
+
+/** 모드 토글 + 증폭 UI 표시 */
 document.querySelectorAll('input[name="mode"]').forEach(r=>{
   r.addEventListener('change', ()=>{
     mode = document.querySelector('input[name="mode"]:checked').value;
     presenterHints.style.display = (mode==='presenter') ? 'block' : 'none';
+    gainRow.style.display = (mode==='presenter') ? 'flex' : 'none';
   });
 });
 presenterHints.style.display = 'block';
+gainRow.style.display = 'flex';
+
+/** 슬라이더 실시간 반영 */
+if (gainSlider) {
+  gainSlider.addEventListener('input', () => {
+    if (gainNode) {
+      const v = parseFloat(gainSlider.value);
+      gainNode.gain.value = v;
+      gainVal.textContent = v.toFixed(1);
+    }
+  });
+}
 
 /** ICE servers */
 const iceServers = [{ urls: ['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302'] }];
@@ -177,7 +207,7 @@ function createPeer(){
 window.addEventListener('DOMContentLoaded', ()=>{
   const p = new URLSearchParams(location.search);
   const m = p.get('mode'); const r = p.get('room'); const a = p.get('autostart');
-  if(m==='viewer'){ document.querySelector('input[name="mode"][value="viewer"]').checked = true; presenterHints.style.display = 'none'; mode='viewer'; }
+  if(m==='viewer'){ document.querySelector('input[name="mode"][value="viewer"]').checked = true; presenterHints.style.display = 'none'; gainRow.style.display='none'; mode='viewer'; }
   if(r){ roomIdInput.value = r; }
   if(a==='1'){ setTimeout(()=>startBtn.click(), 400); }
 });
@@ -193,7 +223,7 @@ function enableAudioPlayback(){
 }
 unmuteBtn.addEventListener('click', enableAudioPlayback);
 
-/** Presenter */
+/** 송출자 */
 async function startPresenter(){
   roomId = (roomIdInput.value || '').replace(/\s+/g,''); // 공백 제거
   if(!roomId){ roomId = 'rm-' + randomId(9); roomIdInput.value = roomId; }
@@ -205,23 +235,47 @@ async function startPresenter(){
     alert('화면 공유 권한 필요: ' + e.message); return;
   }
 
-  // 시스템 오디오가 없으면 마이크 보조 혼합
-  if(!screenStream.getAudioTracks().length){
-    log('[Presenter] system audio track 없음 → 마이크 보조 시도');
-    try{
+  // Web Audio 준비 + Gain
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  gainNode = audioCtx.createGain();
+  const initialGain = parseFloat(gainSlider?.value || '2') || 2.0;
+  gainNode.gain.value = initialGain;
+  if (gainVal) gainVal.textContent = initialGain.toFixed(1);
+
+  const videoTracks = screenStream.getVideoTracks();
+  const screenAudioTracks = screenStream.getAudioTracks();
+  let outputAudioTrack = null;
+
+  if (screenAudioTracks.length) {
+    // 시스템/탭 오디오 → 증폭
+    const src = audioCtx.createMediaStreamSource(screenStream);
+    const dest = audioCtx.createMediaStreamDestination();
+    src.connect(gainNode).connect(dest);
+    outputAudioTrack = dest.stream.getAudioTracks()[0];
+  } else {
+    // 오디오가 없으면 마이크 보조 + 증폭
+    try {
       const mic = await navigator.mediaDevices.getUserMedia({
-        audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+        audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
       });
-      localStream = new MediaStream([...screenStream.getVideoTracks(), ...mic.getAudioTracks()]);
-    }catch(e){
-      log('[Presenter] 마이크 실패: '+e.message);
-      localStream = screenStream;
+      const src = audioCtx.createMediaStreamSource(mic);
+      const dest = audioCtx.createMediaStreamDestination();
+      src.connect(gainNode).connect(dest);
+      outputAudioTrack = dest.stream.getAudioTracks()[0];
+      log('[Presenter] 시스템 오디오 없음 → 마이크 보조 사용');
+    } catch (e) {
+      log('[Presenter] 마이크 획득 실패: ' + e.message);
     }
-  }else{
-    localStream = screenStream;
   }
 
-  log('[Presenter] audio tracks: ' + localStream.getAudioTracks().map(t=>t.label).join(', ') );
+  // 최종 localStream
+  if (outputAudioTrack) {
+    localStream = new MediaStream([...videoTracks, outputAudioTrack]);
+  } else {
+    localStream = new MediaStream([...videoTracks]); // 영상만
+  }
+
+  log('[Presenter] audio track:', localStream.getAudioTracks().map(t=>t.label).join(', ') || '(없음)');
   player.srcObject = localStream;
 
   // pending offers listen
@@ -294,7 +348,7 @@ function denyViewer(vid, li){
   li.remove();
 }
 
-/** Viewer */
+/** 시청자 */
 async function startViewer(){
   roomId = (roomIdInput.value || '').replace(/\s+/g,'');
   if(!roomId){ alert('방 코드를 입력하세요.'); return; }
@@ -302,7 +356,7 @@ async function startViewer(){
   viewerId = randomId(8);
   pc = createPeer();
 
-  // recvonly transceivers (오디오 반드시 포함)
+  // recvonly transceivers
   pc.addTransceiver('video', { direction:'recvonly' });
   pc.addTransceiver('audio', { direction:'recvonly' });
 
